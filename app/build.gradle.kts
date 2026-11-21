@@ -231,10 +231,11 @@ android {
         // 配合公开的签名证书即可完整复现密钥派生、解开插件载荷。
         // 因子现由 libhdguard.so 在运行时供给（见 app/src/main/cpp/hdguard.c），
         // 上面算出的 kdfFactor 仍用于校验 native 侧数据的一致性，但不进入 APK。
-        // 仅在配置了签名口令时校验因子一致性。
-        // 无签名口令（如 CI 未注入 secrets / debug 构建）时跳过，
-        // 该分支构建的包无法解密 v2 插件，属预期行为，不应阻断构建。
-        if (signSecret.isNotEmpty()) {
+        val isDebugSigning = kdfProps.getProperty("debugSigning")?.toBooleanStrictOrNull() == true
+        // 仅在正式签名（非 debug 回退）时校验因子一致性。
+        // debug 签名（CI 无 secrets 回退）推导的因子与 libhdguard.so 内置值不一致，
+        // 属预期行为，跳过校验不阻断构建。
+        if (!isDebugSigning && signSecret.isNotEmpty()) {
             check(kdfFactor == HD_GUARD_EXPECTED_FACTOR) {
                 "[华灯] 签名口令推导出的因子与 libhdguard.so 内置值不一致。" +
                     "两者必须相同，否则 APK 无法解密 v2 插件。" +
