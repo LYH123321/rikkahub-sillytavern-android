@@ -510,44 +510,115 @@ class ChatCompletionsAPI(
         includeOpenRouterReasoningDetails: Boolean = false,
         supportInputModalities: List<Modality> = listOf(Modality.TEXT, Modality.IMAGE),
         systemPromptInChat: Boolean = false,
-    ) = buildJsonArray {
+    ): JsonArray {
         val filteredMessages = messages.filter { it.isValidToUpload() }
-        var ackInserted = false
 
-        filteredMessages.forEach { message ->
-            if (message.role == MessageRole.SYSTEM) {
-                // 防空回复（systemPromptInChat）：SYSTEM 消息原位转为 user 轮
-                // （Gemini 经 OpenAI 兼容中转/映射场景不支持 system role），
-                // 首个系统块后跟一条假 assistant 确认轮，避免模型把系统内容当用户提问。
-                // 默认路径必须原位保留 system role：主系统提示词、记忆注入、userContext、
-                // 世界书 system 注入全走 SYSTEM 消息（2026-09-08 曾在此整体丢弃，导致
-                // 记忆/人设静默失效，勿回退）
+        // 缓存优化：分离静态前缀与动态注入
+        // 第一条 SYSTEM = 静态预设前缀（死守头部，字节不变，命中缓存）
+        // 后续 SYSTEM = 动态注入（记忆/userContext/世界书，甩到最后一条 user 消息尾部）
+        val staticSystem = filteredMessages.firstOrNull { it.role == MessageRole.SYSTEM }
+        val dynamicSystems = filteredMessages.filter {
+            it.role == MessageRole.SYSTEM && it !== staticSystem
+        }
+        val conversationMessages = filteredMessages.filter { it.role != MessageRole.SYSTEM }
+
+        val conversationArray = buildJsonArray {
+            var ackInserted = false
+
+            // 步骤1：静态前缀死守头部（唯一一条 system 消息，内容绝对固定）
+            if (staticSystem != null) {
                 if (!systemPromptInChat) {
-                    addNonAssistantMessage(message)
-                    return@forEach
-                }
-                addNonAssistantMessage(message, asUserRole = true)
-                if (!ackInserted) {
-                    ackInserted = true
+                    addNonAssistantMessage(staticSystem)
+                } else {
+                    addNonAssistantMessage(staticSystem, asUserRole = true)
                     add(buildJsonObject {
                         put("role", "assistant")
                         put("content", "Understood.")
                     })
+                    ackInserted = true
                 }
-                return@forEach
             }
-            if (message.role == MessageRole.ASSISTANT) {
-                addAssistantMessages(
-                    message = message,
-                    includeReasoning = includeHistoryReasoning,
-                    includeToolReasoning = includeToolReasoning,
-                    includeOpenRouterReasoningDetails = includeOpenRouterReasoningDetails,
-                    supportInputModalities = supportInputModalities,
-                )
-            } else {
-                addNonAssistantMessage(message)
+
+            // 步骤2：历史上下文原位保留（user/assistant 轮次稳定不变）
+            conversationMessages.forEach { message ->
+                if (message.role == MessageRole.ASSISTANT) {
+                    addAssistantMessages(
+                        message = message,
+                        includeReasoning = includeHistoryReasoning,
+                        includeToolReasoning = includeToolReasoning,
+                        includeOpenRouterReasoningDetails = includeOpenRouterReasoningDetails,
+                        supportInputModalities = supportInputModalities,
+                    )
+                } else {
+                    addNonAssistantMessage(message)
+                }
             }
         }
+
+        // 步骤3：动态注入甩到最后一条 user 消息尾部（不污染缓存前缀）
+        if (dynamicSystems.isNotEmpty()) {
+            val dynamicBlock = dynamicSystems.joinToString(separator = "\n\n") { msg ->
+                extractSystemText(msg)
+            }
+
+            val lastUserIdx = conversationArray.indexOfLast { element ->
+                element.jsonObject["role"]?.jsonPrimitive?.contentOrNull == "user"
+            }
+
+            if (lastUserIdx >= 0) {
+                // 追加到已有 user 消息的 content
+                val userObj = conversationArray[lastUserIdx].jsonObject
+                val contentElem = userObj["content"]
+                val mergedContent: JsonElement = when (contentElem) {
+                    is JsonPrimitive -> {
+                        JsonPrimitive("${contentElem.content}\n\n$dynamicBlock")
+                    }
+                    is JsonArray -> {
+                        // 多模态消息：在 content 数组末尾追加文本元素
+                        buildJsonArray {
+                            contentElem.jsonArray.forEach { add(it) }
+                            add(buildJsonObject {
+                                put("type", "text")
+                                put("text", dynamicBlock)
+                            })
+                        }
+                    }
+                    else -> JsonPrimitive(dynamicBlock)
+                }
+
+                return buildJsonArray {
+                    conversationArray.forEachIndexed { idx, element ->
+                        if (idx == lastUserIdx) {
+                            add(buildJsonObject {
+                                userObj.forEach { (k, v) ->
+                                    if (k != "content") put(k, v)
+                                }
+                                put("content", mergedContent)
+                            })
+                        } else {
+                            add(element)
+                        }
+                    }
+                }
+            } else {
+                // 无 user 消息：动态注入作为独立 user 消息追加到尾部
+                return buildJsonArray {
+                    conversationArray.forEach { add(it) }
+                    add(buildJsonObject {
+                        put("role", "user")
+                        put("content", dynamicBlock)
+                    })
+                }
+            }
+        }
+
+        return conversationArray
+    }
+
+    private fun extractSystemText(message: UIMessage): String {
+        return message.parts
+            .filterIsInstance<UIMessagePart.Text>()
+            .joinToString(separator = "\n") { it.text }
     }
 
     private fun JsonArrayBuilder.addAssistantMessages(
