@@ -35,9 +35,56 @@ jobs:
           echo "sdkmanager = $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" >> $GITHUB_ENV
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
       # 提前把 NDK / CMake 装好并校验，避免 AGP 在 Gradle 任务内部隐式下载。
-      # 版本取自 gradle.properties，与模块 ndkVersion 同源。
-      - name: Setup Android native toolchain
-        uses: ./.github/actions/setup-android-native
+      # 内联实现，不使用复合 action（其 action.yml 硬编码了 ANDROID_HOME，覆盖上层设置）。
+      - name: Install NDK & CMake
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          echo "SDK_ROOT = $SDK_ROOT"
+
+          # 从 gradle.properties 读取 NDK/CMake 版本
+          GP="${GITHUB_WORKSPACE:-$PWD}/gradle.properties"
+          read_gp() {
+            [ -f "$GP" ] || { echo ""; return; }
+            sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p" "$GP" | tail -n 1
+          }
+          NDK_VERSION="$(read_gp rikkahub.ndkVersion)"
+          CMAKE_VERSION="$(read_gp rikkahub.cmakeVersion)"
+          echo "NDK_VERSION   = $NDK_VERSION"
+          echo "CMAKE_VERSION = $CMAKE_VERSION"
+
+          SDKMANAGER="$(command -v sdkmanager)"
+          echo "sdkmanager = $SDKMANAGER"
+
+          # 接受许可
+          set +o pipefail
+          yes 2>/dev/null | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /tmp/sdk-licenses.log 2>&1 || true
+          set -o pipefail
+
+          install_pkg() {
+            pkg="$1"; dest="$2"; label="$3"
+            if [ -f "$dest/source.properties" ]; then
+              echo "[sdk] $label 已就绪：$dest"
+              return 0
+            fi
+            n=1
+            while [ "$n" -le 4 ]; do
+              echo "[sdk] 第 $n/4 次安装 $label ($pkg)"
+              rm -rf "$SDK_ROOT/.temp" "$SDK_ROOT/.downloadIntermediates" || true
+              "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "$pkg" > /tmp/sdk-install.log 2>&1 || {
+                echo "[sdk] $label 安装失败，重试"; n=$((n+1)); sleep 3; continue
+              }
+              if [ -f "$dest/source.properties" ]; then
+                echo "[sdk] $label 安装成功"; return 0
+              fi
+              n=$((n+1))
+            done
+            echo "::error::$label 连续 4 次安装失败：$pkg"
+            return 1
+          }
+
+          install_pkg "ndk;$NDK_VERSION" "$SDK_ROOT/ndk/$NDK_VERSION" "NDK $NDK_VERSION"
+          install_pkg "cmake;$CMAKE_VERSION" "$SDK_ROOT/cmake/$CMAKE_VERSION" "CMake $CMAKE_VERSION"
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
